@@ -1,206 +1,273 @@
 import os
 import time
 import logging
-from datetime import datetime
 import requests
-import pandas as pd
-import numpy as np
-import yfinance as yf
+import json
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
-GOLD_API_KEY = os.environ.get('GOLD_API_KEY')
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
+GOLD_API_KEY = os.environ.get('GOLD_API_KEY', '')
 
-def send_telegram(msg):
-    url = 'https://api.telegram.org/bot' + TOKEN + '/sendMessage'
-    data = {'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'}
+price_history = []
+
+def send_telegram(message):
+    url = 'https://api.telegram.org/bot' + TELEGRAM_BOT_TOKEN + '/sendMessage'
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': message,
+        'parse_mode': 'HTML'
+    }
     try:
-        r = requests.post(url, data=data, timeout=10)
-        logger.info('Telegram: ' + str(r.status_code))
-        return r.ok
+        r = requests.post(url, json=payload, timeout=10)
+        logger.info('Telegram response: ' + str(r.status_code))
+        return r.status_code == 200
     except Exception as e:
         logger.error('Telegram error: ' + str(e))
         return False
 
-def get_live_price():
+def get_price_gold_api():
     try:
-        url = 'https://www.goldapi.io/api/XAU/USD'
-        headers = {'x-access-token': GOLD_API_KEY}
-        r = requests.get(url, headers=headers, timeout=10)
+        headers = {
+            'x-access-token': GOLD_API_KEY,
+            'Content-Type': 'application/json'
+        }
+        r = requests.get('https://www.goldapi.io/api/XAU/USD', headers=headers, timeout=10)
         data = r.json()
-        price = float(data.get('price'))
-        logger.info('Live price: ' + str(price))
+        price = float(data['price'])
+        logger.info('Gold API price: ' + str(price))
         return price
     except Exception as e:
-        logger.error('Gold API error: ' + str(e))
+        logger.error('Gold API failed: ' + str(e))
         return None
 
-def get_historical_prices():
+def get_price_yahoo():
     try:
-        df = yf.Ticker('GC=F').history(period='5d', interval='5m')
-        if not df.empty:
-            prices = df['Close'].dropna().tolist()
-            logger.info('Loaded ' + str(len(prices)) + ' historical prices')
-            return prices
+        url = 'https://query1.finance.yahoo.com/v8/finance/chart/GC=F'
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        r = requests.get(url, headers=headers, timeout=10)
+        data = r.json()
+        price = float(data['chart']['result'][0]['meta']['regularMarketPrice'])
+        logger.info('Yahoo price: ' + str(price))
+        return price
     except Exception as e:
-        logger.error('Historical fetch error: ' + str(e))
-    return []
+        logger.error('Yahoo failed: ' + str(e))
+        return None
+
+def get_price_metals_live():
+    try:
+        r = requests.get('https://metals-api.com/api/latest?access_key=free&base=USD&symbols=XAU', timeout=10)
+        data = r.json()
+        price = float(1.0 / data['rates']['XAU'])
+        logger.info('Metals-live price: ' + str(price))
+        return price
+    except Exception as e:
+        logger.error('Metals-live failed: ' + str(e))
+        return None
+
+def get_live_price():
+    price = get_price_gold_api()
+    if price and price > 1000:
+        return price
+    logger.warning('Gold API failed, trying Yahoo...')
+    price = get_price_yahoo()
+    if price and price > 1000:
+        return price
+    logger.warning('Yahoo failed, trying backup...')
+    price = get_price_metals_live()
+    if price and price > 1000:
+        return price
+    logger.error('All price sources failed')
+    return None
+
+def load_history():
+    global price_history
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker('GC=F')
+        hist = ticker.history(period='5d', interval='5m')
+        if not hist.empty:
+            price_history = list(hist['Close'].dropna().values)[-100:]
+            logger.info('Loaded ' + str(len(price_history)) + ' historical prices')
+    except Exception as e:
+        logger.warning('Could not load history: ' + str(e))
 
 def calculate_rsi(prices, period=14):
     if len(prices) < period + 1:
         return 50
-    series = pd.Series(prices)
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0).rolling(period).mean()
-    loss = -delta.where(delta < 0, 0).rolling(period).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return float(rsi.iloc[-1])
+    gains = []
+    losses = []
+    for i in range(1, len(prices)):
+        diff = prices[i] - prices[i-1]
+        if diff > 0:
+            gains.append(diff)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(diff))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-def calculate_ema(prices, span):
-    if len(prices) < 2:
-        return prices[-1]
-    return float(pd.Series(prices).ewm(span=span, adjust=False).mean().iloc[-1])
+def calculate_ema(prices, period):
+    if len(prices) < period:
+        return prices[-1] if prices else 0
+    k = 2.0 / (period + 1)
+    ema = sum(prices[:period]) / period
+    for price in prices[period:]:
+        ema = price * k + ema * (1 - k)
+    return ema
 
 def calculate_macd(prices):
     if len(prices) < 26:
         return 0, 0
-    series = pd.Series(prices)
-    macd = series.ewm(span=12, adjust=False).mean() - series.ewm(span=26, adjust=False).mean()
-    signal = macd.ewm(span=9, adjust=False).mean()
-    hist = macd - signal
-    return float(hist.iloc[-1]), float(hist.iloc[-2])
+    ema12 = calculate_ema(prices, 12)
+    ema26 = calculate_ema(prices, 26)
+    macd_line = ema12 - ema26
+    signal = macd_line
+    return macd_line, signal
 
-def generate_signal(prices):
-    if len(prices) < 50:
-        return None, 50, 0, 1
+def generate_signal(current_price):
+    global price_history
+    price_history.append(current_price)
+    if len(price_history) > 200:
+        price_history = price_history[-200:]
 
-    price = prices[-1]
-    ema9  = calculate_ema(prices, 9)
-    ema21 = calculate_ema(prices, 21)
-    ema50 = calculate_ema(prices, 50)
-    ema200 = calculate_ema(prices, min(200, len(prices)))
+    if len(price_history) < 30:
+        return None
+
+    prices = price_history
+
     rsi = calculate_rsi(prices)
-    macd_hist, macd_prev = calculate_macd(prices)
-
-    recent = prices[-20:]
-    atr = max(recent) - min(recent)
-    if atr < 1:
-        atr = price * 0.003
-
-    buys = sells = 0
-
-    if ema9 > ema21 > ema50: buys += 3
-    elif ema9 < ema21 < ema50: sells += 3
-
-    if price > ema200: buys += 2
-    else: sells += 2
-
-    if rsi < 35: buys += 2
-    elif rsi > 65: sells += 2
-    elif 35 <= rsi < 45: buys += 1
-    elif 55 < rsi <= 65: sells += 1
-
-    if macd_hist > 0 and macd_hist > macd_prev: buys += 2
-    elif macd_hist < 0 and macd_hist < macd_prev: sells += 2
-
-    if price > prices[-5]: buys += 1
-    else: sells += 1
-
-    total = buys + sells
-    if total == 0:
-        return None, rsi, 0, atr
-
-    if buys > sells:
-        raw = buys / total
-        if raw >= 0.80:
-            conf = min(int(85 + (raw - 0.80) / 0.20 * 15), 100)
-            return 'BUY', rsi, conf, atr
-    elif sells > buys:
-        raw = sells / total
-        if raw >= 0.80:
-            conf = min(int(85 + (raw - 0.80) / 0.20 * 15), 100)
-            return 'SELL', rsi, conf, atr
-
-    return None, rsi, 0, atr
-
-def build_message(prices, price, direction, rsi, conf, atr):
-    now = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
-    rsi_str = str(round(rsi, 1))
-    rsi_comment = 'Oversold' if rsi < 35 else 'Overbought' if rsi > 65 else 'Neutral'
-    filled = int((conf - 85) / 15 * 10) if conf >= 85 else 0
-    bar = filled * 'green' 
-
     ema9 = calculate_ema(prices, 9)
     ema21 = calculate_ema(prices, 21)
-    trend = 'Bullish' if ema9 > ema21 else 'Bearish'
+    ema50 = calculate_ema(prices, 50) if len(prices) >= 50 else current_price
+    macd, signal = calculate_macd(prices)
 
-    if direction == 'BUY':
-        tp = round(price + (atr * 2.0), 2)
-        sl = round(price - atr, 2)
-        msg = '\U0001F7E2 *XAUUSD BUY SIGNAL* \U0001F4C8\n'
-        msg += '\u2501' * 20 + '\n'
-        msg += '\U0001F4B0 *Live Price:* `$' + '{:,.2f}'.format(price) + '`\n'
-        msg += '\u23F0 `' + now + '`\n\n'
-        msg += '\U0001F4CA *TRADE DETAILS*\n'
-        msg += '\u251C \U0001F3AF Entry: `$' + '{:,.2f}'.format(price) + '`\n'
-        msg += '\u251C \u2705 TP:    `$' + '{:,.2f}'.format(tp) + '`\n'
-        msg += '\u2514 \u274C SL:    `$' + '{:,.2f}'.format(sl) + '`\n\n'
-        msg += '\U0001F4C9 RSI: `' + rsi_str + '` ' + rsi_comment + '\n'
-        msg += '\U0001F4AA Strength: `' + str(conf) + '%`\n'
-        msg += '\u26A0\uFE0F _Trade at your own risk_\n'
-        msg += '\u2501' * 20
-        return msg
-    elif direction == 'SELL':
-        tp = round(price - (atr * 2.0), 2)
-        sl = round(price + atr, 2)
-        msg = '\U0001F534 *XAUUSD SELL SIGNAL* \U0001F4C9\n'
-        msg += '\u2501' * 20 + '\n'
-        msg += '\U0001F4B0 *Live Price:* `$' + '{:,.2f}'.format(price) + '`\n'
-        msg += '\u23F0 `' + now + '`\n\n'
-        msg += '\U0001F4CA *TRADE DETAILS*\n'
-        msg += '\u251C \U0001F3AF Entry: `$' + '{:,.2f}'.format(price) + '`\n'
-        msg += '\u251C \u2705 TP:    `$' + '{:,.2f}'.format(tp) + '`\n'
-        msg += '\u2514 \u274C SL:    `$' + '{:,.2f}'.format(sl) + '`\n\n'
-        msg += '\U0001F4C9 RSI: `' + rsi_str + '` ' + rsi_comment + '\n'
-        msg += '\U0001F4AA Strength: `' + str(conf) + '%`\n'
-        msg += '\u26A0\uFE0F _Trade at your own risk_\n'
-        msg += '\u2501' * 20
-        return msg
+    buy_score = 0
+    sell_score = 0
+
+    if rsi < 35:
+        buy_score += 25
+    elif rsi < 45:
+        buy_score += 15
+    if rsi > 65:
+        sell_score += 25
+    elif rsi > 55:
+        sell_score += 15
+
+    if ema9 > ema21:
+        buy_score += 20
     else:
-        msg = '\U0001F4E1 *XAUUSD LIVE UPDATE*\n'
-        msg += '\u2501' * 20 + '\n'
-        msg += '\U0001F4B0 Price: `$' + '{:,.2f}'.format(price) + '`\n'
-        msg += '\u23F0 `' + now + '`\n'
-        msg += '\U0001F4CA Trend: `' + trend + '`\n'
-        msg += '\U0001F4C9 RSI: `' + rsi_str + '` ' + rsi_comment + '\n'
-        msg += '_Waiting for 85%+ signal..._\n'
-        msg += '\u2501' * 20
-        return msg
+        sell_score += 20
+
+    if current_price > ema50:
+        buy_score += 20
+    else:
+        sell_score += 20
+
+    if macd > signal:
+        buy_score += 20
+    else:
+        sell_score += 20
+
+    recent = prices[-5:]
+    if len(recent) >= 3:
+        if recent[-1] > recent[-3]:
+            buy_score += 15
+        else:
+            sell_score += 15
+
+    if buy_score >= 85:
+        direction = 'BUY'
+        strength = min(buy_score, 100)
+        entry = current_price
+        tp1 = round(entry + 5.0, 2)
+        tp2 = round(entry + 10.0, 2)
+        tp3 = round(entry + 18.0, 2)
+        sl = round(entry - 8.0, 2)
+        return direction, strength, entry, tp1, tp2, tp3, sl
+    elif sell_score >= 85:
+        direction = 'SELL'
+        strength = min(sell_score, 100)
+        entry = current_price
+        tp1 = round(entry - 5.0, 2)
+        tp2 = round(entry - 10.0, 2)
+        tp3 = round(entry - 18.0, 2)
+        sl = round(entry + 8.0, 2)
+        return direction, strength, entry, tp1, tp2, tp3, sl
+
+    return None
+
+def format_signal(direction, strength, entry, tp1, tp2, tp3, sl, price):
+    bar_filled = int(strength / 10)
+    bar = '🟩' * bar_filled + '⬜' * (10 - bar_filled)
+    arrow = '📈' if direction == 'BUY' else '📉'
+    emoji = '🟢' if direction == 'BUY' else '🔴'
+
+    msg = (
+        '<b>⚡ XAUUSD SIGNAL ALERT ⚡</b>\n\n'
+        + emoji + ' <b>Direction: ' + direction + '</b> ' + arrow + '\n'
+        + '💰 <b>Live Price: $' + str(round(price, 2)) + '</b>\n\n'
+        + '📊 <b>Signal Strength: ' + str(strength) + '%</b>\n'
+        + bar + '\n\n'
+        + '🎯 <b>Entry:</b> $' + str(entry) + '\n'
+        + '✅ <b>TP1:</b> $' + str(tp1) + '\n'
+        + '✅ <b>TP2:</b> $' + str(tp2) + '\n'
+        + '✅ <b>TP3:</b> $' + str(tp3) + '\n'
+        + '🛑 <b>Stop Loss:</b> $' + str(sl) + '\n\n'
+        + '⏱ Next signal in 5 minutes\n'
+        + '#XAUUSD #Gold #Forex'
+    )
+    return msg
 
 def main():
     logger.info('Bot starting...')
-    send_telegram('\U0001F916 *XAUUSD Signal Bot LIVE!*\n\n\u2705 Real-time gold prices\n\U0001F4AA Only 85-100% strength signals\n\U0001F4E1 Checking every 5 minutes\n\n_Loading data... first signal in 1 min_ \U0001F680')
 
-    price_history = get_historical_prices()
-    if not price_history:
-        price_history = []
+    test = send_telegram('🤖 <b>XAUUSD Signal Bot is LIVE!</b>\n\n✅ Real-time gold prices active\n💪 Only 85-100% strength signals\n📡 Checking every 5 minutes\n\n<i>First signal coming shortly...</i>')
+    logger.info('Startup message sent: ' + str(test))
+
+    load_history()
+
+    no_signal_count = 0
 
     while True:
         try:
-            live_price = get_live_price()
-            if live_price:
-                price_history.append(live_price)
-                if len(price_history) > 500:
-                    price_history.pop(0)
-                direction, rsi, conf, atr = generate_signal(price_history)
-                msg = build_message(price_history, live_price, direction, rsi, conf, atr)
+            price = get_live_price()
+
+            if price is None:
+                logger.error('Could not get price from any source')
+                time.sleep(60)
+                continue
+
+            logger.info('Current XAUUSD price: $' + str(price))
+
+            result = generate_signal(price)
+
+            if result:
+                direction, strength, entry, tp1, tp2, tp3, sl = result
+                msg = format_signal(direction, strength, entry, tp1, tp2, tp3, sl, price)
                 send_telegram(msg)
+                logger.info('Signal sent: ' + direction + ' ' + str(strength) + '%')
+                no_signal_count = 0
             else:
-                logger.warning('Could not fetch live price')
+                no_signal_count += 1
+                logger.info('No strong signal yet. Price: $' + str(price))
+                if no_signal_count >= 6:
+                    send_telegram(
+                        '📡 <b>XAUUSD Monitor</b>\n\n'
+                        + '💰 Live Price: $' + str(round(price, 2)) + '\n'
+                        + '🔍 Scanning for 85-100% signal...\n'
+                        + '⏳ Market conditions not ideal yet\n'
+                        + '✅ Bot is active and watching!'
+                    )
+                    no_signal_count = 0
+
         except Exception as e:
             logger.error('Main loop error: ' + str(e))
 
