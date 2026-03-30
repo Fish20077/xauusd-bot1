@@ -10,44 +10,43 @@ import yfinance as yf
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(**name**)
 
-TOKEN = os.environ.get(“TELEGRAM_BOT_TOKEN”)
-CHAT_ID = os.environ.get(“TELEGRAM_CHAT_ID”)
-GOLD_API_KEY = os.environ.get(“GOLD_API_KEY”)
+TOKEN = os.environ.get(‘TELEGRAM_BOT_TOKEN’)
+CHAT_ID = os.environ.get(‘TELEGRAM_CHAT_ID’)
+GOLD_API_KEY = os.environ.get(‘GOLD_API_KEY’)
 
 def send_telegram(msg):
-url = f”https://api.telegram.org/bot{TOKEN}/sendMessage”
-data = {“chat_id”: CHAT_ID, “text”: msg, “parse_mode”: “Markdown”}
+url = ‘https://api.telegram.org/bot’ + TOKEN + ‘/sendMessage’
+data = {‘chat_id’: CHAT_ID, ‘text’: msg, ‘parse_mode’: ‘Markdown’}
 try:
 r = requests.post(url, data=data, timeout=10)
-logger.info(f”Telegram: {r.status_code}”)
+logger.info(’Telegram: ’ + str(r.status_code))
 return r.ok
 except Exception as e:
-logger.error(f”Telegram error: {e}”)
+logger.error(’Telegram error: ’ + str(e))
 return False
 
 def get_live_price():
 try:
-url = “https://www.goldapi.io/api/XAU/USD”
-headers = {“x-access-token”: GOLD_API_KEY}
+url = ‘https://www.goldapi.io/api/XAU/USD’
+headers = {‘x-access-token’: GOLD_API_KEY}
 r = requests.get(url, headers=headers, timeout=10)
 data = r.json()
-price = float(data.get(“price”))
-logger.info(f”Live price: {price}”)
+price = float(data.get(‘price’))
+logger.info(’Live price: ’ + str(price))
 return price
 except Exception as e:
-logger.error(f”Gold API error: {e}”)
+logger.error(’Gold API error: ’ + str(e))
 return None
 
 def get_historical_prices():
-“”“Bootstrap price history from Yahoo Finance”””
 try:
-df = yf.Ticker(“GC=F”).history(period=“5d”, interval=“5m”)
+df = yf.Ticker(‘GC=F’).history(period=‘5d’, interval=‘5m’)
 if not df.empty:
-prices = df[“Close”].dropna().tolist()
-logger.info(f”Loaded {len(prices)} historical prices”)
+prices = df[‘Close’].dropna().tolist()
+logger.info(‘Loaded ’ + str(len(prices)) + ’ historical prices’)
 return prices
 except Exception as e:
-logger.error(f”Historical fetch error: {e}”)
+logger.error(’Historical fetch error: ’ + str(e))
 return []
 
 def calculate_rsi(prices, period=14):
@@ -95,25 +94,20 @@ if atr < 1:
 
 buys = sells = 0
 
-# EMA alignment (3 pts)
 if ema9 > ema21 > ema50: buys += 3
 elif ema9 < ema21 < ema50: sells += 3
 
-# Price vs EMA200 (2 pts)
 if price > ema200: buys += 2
 else: sells += 2
 
-# RSI (2 pts)
 if rsi < 35: buys += 2
 elif rsi > 65: sells += 2
 elif 35 <= rsi < 45: buys += 1
 elif 55 < rsi <= 65: sells += 1
 
-# MACD (2 pts)
 if macd_hist > 0 and macd_hist > macd_prev: buys += 2
 elif macd_hist < 0 and macd_hist < macd_prev: sells += 2
 
-# Momentum (1 pt)
 if price > prices[-5]: buys += 1
 else: sells += 1
 
@@ -125,90 +119,77 @@ if buys > sells:
     raw = buys / total
     if raw >= 0.80:
         conf = min(int(85 + (raw - 0.80) / 0.20 * 15), 100)
-        return "BUY", rsi, conf, atr
+        return 'BUY', rsi, conf, atr
 elif sells > buys:
     raw = sells / total
     if raw >= 0.80:
         conf = min(int(85 + (raw - 0.80) / 0.20 * 15), 100)
-        return "SELL", rsi, conf, atr
+        return 'SELL', rsi, conf, atr
 
 return None, rsi, 0, atr
 ```
 
-def build_message(price, direction, rsi, conf, atr):
-now = datetime.utcnow().strftime(”%Y-%m-%d %H:%M UTC”)
-rsi_str = f”{rsi:.1f}”
-rsi_comment = “⚠️ Oversold” if rsi < 35 else “⚠️ Overbought” if rsi > 65 else “✅ Neutral”
+def build_message(prices, price, direction, rsi, conf, atr):
+now = datetime.utcnow().strftime(’%Y-%m-%d %H:%M UTC’)
+rsi_str = str(round(rsi, 1))
+rsi_comment = ‘Oversold’ if rsi < 35 else ‘Overbought’ if rsi > 65 else ‘Neutral’
 filled = int((conf - 85) / 15 * 10) if conf >= 85 else 0
-bar = “🟩” * filled + “⬜” * (10 - filled)
+bar = filled * ‘green’
 
 ```
-if direction == "BUY":
-    tp = price + (atr * 2.0)
-    sl = price - atr
-    return f"""
-```
+ema9 = calculate_ema(prices, 9)
+ema21 = calculate_ema(prices, 21)
+trend = 'Bullish' if ema9 > ema21 else 'Bearish'
 
-🟢 *XAUUSD BUY SIGNAL* 📈
-━━━━━━━━━━━━━━━━━━━━
-💰 *Live Price:* `${price:,.2f}`
-⏰ `{now}`
-
-📊 *TRADE DETAILS*
-├ 🎯 Entry: `${price:,.2f}`
-├ ✅ TP:    `${tp:,.2f}`
-└ ❌ SL:    `${sl:,.2f}`
-
-📉 RSI: `{rsi_str}` {rsi_comment}
-💪 Strength: `{conf}%`
-{bar}
-⚠️ *Trade at your own risk*
-━━━━━━━━━━━━━━━━━━━━
-“””
-elif direction == “SELL”:
-tp = price - (atr * 2.0)
-sl = price + atr
-return f”””
-🔴 *XAUUSD SELL SIGNAL* 📉
-━━━━━━━━━━━━━━━━━━━━
-💰 *Live Price:* `${price:,.2f}`
-⏰ `{now}`
-
-📊 *TRADE DETAILS*
-├ 🎯 Entry: `${price:,.2f}`
-├ ✅ TP:    `${tp:,.2f}`
-└ ❌ SL:    `${sl:,.2f}`
-
-📉 RSI: `{rsi_str}` {rsi_comment}
-💪 Strength: `{conf}%`
-{bar}
-⚠️ *Trade at your own risk*
-━━━━━━━━━━━━━━━━━━━━
-“””
+if direction == 'BUY':
+    tp = round(price + (atr * 2.0), 2)
+    sl = round(price - atr, 2)
+    msg = '\U0001F7E2 *XAUUSD BUY SIGNAL* \U0001F4C8\n'
+    msg += '\u2501' * 20 + '\n'
+    msg += '\U0001F4B0 *Live Price:* `$' + '{:,.2f}'.format(price) + '`\n'
+    msg += '\u23F0 `' + now + '`\n\n'
+    msg += '\U0001F4CA *TRADE DETAILS*\n'
+    msg += '\u251C \U0001F3AF Entry: `$' + '{:,.2f}'.format(price) + '`\n'
+    msg += '\u251C \u2705 TP:    `$' + '{:,.2f}'.format(tp) + '`\n'
+    msg += '\u2514 \u274C SL:    `$' + '{:,.2f}'.format(sl) + '`\n\n'
+    msg += '\U0001F4C9 RSI: `' + rsi_str + '` ' + rsi_comment + '\n'
+    msg += '\U0001F4AA Strength: `' + str(conf) + '%`\n'
+    msg += '\u26A0\uFE0F _Trade at your own risk_\n'
+    msg += '\u2501' * 20
+    return msg
+elif direction == 'SELL':
+    tp = round(price - (atr * 2.0), 2)
+    sl = round(price + atr, 2)
+    msg = '\U0001F534 *XAUUSD SELL SIGNAL* \U0001F4C9\n'
+    msg += '\u2501' * 20 + '\n'
+    msg += '\U0001F4B0 *Live Price:* `$' + '{:,.2f}'.format(price) + '`\n'
+    msg += '\u23F0 `' + now + '`\n\n'
+    msg += '\U0001F4CA *TRADE DETAILS*\n'
+    msg += '\u251C \U0001F3AF Entry: `$' + '{:,.2f}'.format(price) + '`\n'
+    msg += '\u251C \u2705 TP:    `$' + '{:,.2f}'.format(tp) + '`\n'
+    msg += '\u2514 \u274C SL:    `$' + '{:,.2f}'.format(sl) + '`\n\n'
+    msg += '\U0001F4C9 RSI: `' + rsi_str + '` ' + rsi_comment + '\n'
+    msg += '\U0001F4AA Strength: `' + str(conf) + '%`\n'
+    msg += '\u26A0\uFE0F _Trade at your own risk_\n'
+    msg += '\u2501' * 20
+    return msg
 else:
-trend = “↑ Bullish” if ema9 > ema21 else “↓ Bearish”
-return f”””
-📡 *XAUUSD LIVE UPDATE*
-━━━━━━━━━━━━━━━━━━━
-💰 Price: `${price:,.2f}`
-⏰ `{now}`
-📊 Trend: `{trend}`
-📉 RSI: `{rsi_str}` {rsi_comment}
-*Waiting for 85%+ signal…*
-━━━━━━━━━━━━━━━━━━━
-“””
-
-# Need ema9/ema21 for trend in no-signal message
-
-ema9_global = ema21_global = 0
+    msg = '\U0001F4E1 *XAUUSD LIVE UPDATE*\n'
+    msg += '\u2501' * 20 + '\n'
+    msg += '\U0001F4B0 Price: `$' + '{:,.2f}'.format(price) + '`\n'
+    msg += '\u23F0 `' + now + '`\n'
+    msg += '\U0001F4CA Trend: `' + trend + '`\n'
+    msg += '\U0001F4C9 RSI: `' + rsi_str + '` ' + rsi_comment + '\n'
+    msg += '_Waiting for 85%+ signal..._\n'
+    msg += '\u2501' * 20
+    return msg
+```
 
 def main():
-global ema9_global, ema21_global
-logger.info(“Bot starting…”)
-send_telegram(“🤖 *XAUUSD Signal Bot LIVE!*\n\n✅ Real-time gold prices\n💪 Only 85-100% strength signals\n📡 Checking every 5 minutes\n\n_Loading historical data… first signal in ~1 min_ 🚀”)
+logger.info(‘Bot starting…’)
+send_telegram(’\U0001F916 *XAUUSD Signal Bot LIVE!*\n\n\u2705 Real-time gold prices\n\U0001F4AA Only 85-100% strength signals\n\U0001F4E1 Checking every 5 minutes\n\n_Loading data… first signal in 1 min_ \U0001F680’)
 
 ```
-# Bootstrap with historical data
 price_history = get_historical_prices()
 if not price_history:
     price_history = []
@@ -220,20 +201,17 @@ while True:
             price_history.append(live_price)
             if len(price_history) > 500:
                 price_history.pop(0)
-
             direction, rsi, conf, atr = generate_signal(price_history)
-            ema9_global = calculate_ema(price_history, 9)
-            ema21_global = calculate_ema(price_history, 21)
-            msg = build_message(live_price, direction, rsi, conf, atr)
+            msg = build_message(price_history, live_price, direction, rsi, conf, atr)
             send_telegram(msg)
         else:
-            logger.warning("Could not fetch live price")
+            logger.warning('Could not fetch live price')
     except Exception as e:
-        logger.error(f"Main loop error: {e}")
+        logger.error('Main loop error: ' + str(e))
 
-    logger.info("Sleeping 5 minutes...")
+    logger.info('Sleeping 5 minutes...')
     time.sleep(300)
 ```
 
-if **name** == “**main**”:
+if **name** == ‘**main**’:
 main()
