@@ -1,12 +1,9 @@
 import os
-import asyncio
+import time
 import logging
 from datetime import datetime
 import yfinance as yf
-import pandas as pd
-import numpy as np
-from telegram import Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -14,213 +11,128 @@ logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+    try:
+        r = requests.post(url, data=data, timeout=10)
+        logger.info(f"Telegram response: {r.status_code} {r.text}")
+        return r.ok
+    except Exception as e:
+        logger.error(f"Telegram error: {e}")
+        return False
 
-def get_xauusd_data():
-    ticker = yf.Ticker("GC=F")
-    df = ticker.history(period="5d", interval="5m")
-    return df
+def get_price():
+    try:
+        ticker = yf.Ticker("GC=F")
+        df = ticker.history(period="5d", interval="5m")
+        if df.empty or len(df) < 50:
+            return None
+        return df
+    except Exception as e:
+        logger.error(f"Price fetch error: {e}")
+        return None
 
-
-def calculate_indicators(df):
+def analyze(df):
     close = df["Close"]
-    ema9 = close.ewm(span=9, adjust=False).mean()
-    ema21 = close.ewm(span=21, adjust=False).mean()
-    ema50 = close.ewm(span=50, adjust=False).mean()
+    ema9 = close.ewm(span=9).mean().iloc[-1]
+    ema21 = close.ewm(span=21).mean().iloc[-1]
+    ema50 = close.ewm(span=50).mean().iloc[-1]
 
     delta = close.diff()
     gain = delta.where(delta > 0, 0).rolling(14).mean()
     loss = -delta.where(delta < 0, 0).rolling(14).mean()
     rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
+    rsi = (100 - (100 / (1 + rs))).iloc[-1]
 
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal_line = macd.ewm(span=9, adjust=False).mean()
-    histogram = macd - signal_line
+    ema12 = close.ewm(span=12).mean()
+    ema26 = close.ewm(span=26).mean()
+    hist = (ema12 - ema26).ewm(span=9).mean()
+    macd_now = hist.iloc[-1]
+    macd_prev = hist.iloc[-2]
 
-    return {
-        "ema9": ema9.iloc[-1],
-        "ema21": ema21.iloc[-1],
-        "ema50": ema50.iloc[-1],
-        "rsi": rsi.iloc[-1],
-        "macd_hist": histogram.iloc[-1],
-        "macd_hist_prev": histogram.iloc[-2],
-        "close": close.iloc[-1],
-        "high": df["High"].iloc[-1],
-        "low": df["Low"].iloc[-1],
-    }
+    price = close.iloc[-1]
+    atr = abs(df["High"].iloc[-1] - df["Low"].iloc[-1])
 
+    buys = sells = 0
+    if ema9 > ema21 > ema50: buys += 2
+    elif ema9 < ema21 < ema50: sells += 2
+    if rsi < 40: buys += 2
+    elif rsi > 60: sells += 2
+    if macd_now > 0 and macd_now > macd_prev: buys += 2
+    elif macd_now < 0 and macd_now < macd_prev: sells += 2
+    if price > ema21: buys += 1
+    else: sells += 1
 
-def generate_signal(indicators):
-    price = indicators["close"]
-    rsi = indicators["rsi"]
-    ema9 = indicators["ema9"]
-    ema21 = indicators["ema21"]
-    ema50 = indicators["ema50"]
-    macd_hist = indicators["macd_hist"]
-    macd_hist_prev = indicators["macd_hist_prev"]
-
-    buy_signals = 0
-    sell_signals = 0
-
-    if ema9 > ema21 > ema50:
-        buy_signals += 2
-    elif ema9 < ema21 < ema50:
-        sell_signals += 2
-
-    if rsi < 40:
-        buy_signals += 2
-    elif rsi > 60:
-        sell_signals += 2
-    elif 40 <= rsi <= 50:
-        buy_signals += 1
-    elif 50 < rsi <= 60:
-        sell_signals += 1
-
-    if macd_hist > 0 and macd_hist > macd_hist_prev:
-        buy_signals += 2
-    elif macd_hist < 0 and macd_hist < macd_hist_prev:
-        sell_signals += 2
-
-    if price > ema21:
-        buy_signals += 1
-    else:
-        sell_signals += 1
-
-    total = buy_signals + sell_signals
-    if total == 0:
-        return None
-
-    atr = abs(indicators["high"] - indicators["low"])
-
-    if buy_signals > sell_signals:
-        confidence = int((buy_signals / total) * 100)
-        if confidence < 55:
-            return None
-        return {
-            "direction": "BUY",
-            "confidence": confidence,
-            "entry": round(price, 2),
-            "tp": round(price + (atr * 1.8), 2),
-            "sl": round(price - (atr * 1.0), 2),
-            "rsi": round(rsi, 1),
-        }
-    elif sell_signals > buy_signals:
-        confidence = int((sell_signals / total) * 100)
-        if confidence < 55:
-            return None
-        return {
-            "direction": "SELL",
-            "confidence": confidence,
-            "entry": round(price, 2),
-            "tp": round(price - (atr * 1.8), 2),
-            "sl": round(price + (atr * 1.0), 2),
-            "rsi": round(rsi, 1),
-        }
-    return None
-
-
-def format_signal_message(signal, price):
+    total = buys + sells
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    direction = signal["direction"]
-    emoji = "🟢" if direction == "BUY" else "🔴"
-    arrow = "📈" if direction == "BUY" else "📉"
-    rsi = signal["rsi"]
-    rsi_comment = "⚠️ Oversold" if rsi < 35 else "⚠️ Overbought" if rsi > 65 else "✅ Neutral"
 
-    return f"""
-{emoji} *XAUUSD {direction} SIGNAL* {arrow}
+    if buys > sells and total > 0:
+        conf = int(buys / total * 100)
+        if conf >= 55:
+            return f"""
+🟢 *XAUUSD BUY SIGNAL* 📈
 ━━━━━━━━━━━━━━━━━━━━
-💰 *Live Price:* `${price:,.2f}`
-⏰ *Time:* `{now}`
+💰 *Price:* `${price:,.2f}`
+⏰ `{now}`
 
 📊 *TRADE DETAILS*
-├ 🎯 Entry:  `${signal['entry']:,.2f}`
-├ ✅ TP:     `${signal['tp']:,.2f}`
-└ ❌ SL:     `${signal['sl']:,.2f}`
+├ 🎯 Entry: `${price:,.2f}`
+├ ✅ TP:    `${price + atr*1.8:,.2f}`
+└ ❌ SL:    `${price - atr:,.2f}`
 
-📉 *INDICATORS*
-├ RSI: `{signal['rsi']}` {rsi_comment}
-└ Signal Strength: `{signal['confidence']}%`
-
-⚠️ _Trade at your own risk._
+📉 RSI: `{rsi:.1f}` | Strength: `{conf}%`
+⚠️ _Trade at your own risk_
+"""
+    elif sells > buys and total > 0:
+        conf = int(sells / total * 100)
+        if conf >= 55:
+            return f"""
+🔴 *XAUUSD SELL SIGNAL* 📉
 ━━━━━━━━━━━━━━━━━━━━
+💰 *Price:* `${price:,.2f}`
+⏰ `{now}`
+
+📊 *TRADE DETAILS*
+├ 🎯 Entry: `${price:,.2f}`
+├ ✅ TP:    `${price - atr*1.8:,.2f}`
+└ ❌ SL:    `${price + atr:,.2f}`
+
+📉 RSI: `{rsi:.1f}` | Strength: `{conf}%`
+⚠️ _Trade at your own risk_
 """
 
-
-def format_price_message(price, indicators):
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    trend = "↑ Bullish" if indicators["ema9"] > indicators["ema21"] else "↓ Bearish"
+    trend = "↑ Bullish" if ema9 > ema21 else "↓ Bearish"
     return f"""
-📡 *XAUUSD LIVE UPDATE*
+📡 *XAUUSD UPDATE*
 ━━━━━━━━━━━━━━━━━━━
 💰 Price: `${price:,.2f}`
-⏰ Time:  `{now}`
+⏰ `{now}`
 📊 Trend: `{trend}`
-📉 RSI:   `{round(indicators['rsi'], 1)}`
-
+📉 RSI: `{rsi:.1f}`
 _No strong signal. Monitoring..._
 """
 
-
-async def send_signal(bot: Bot):
-    try:
-        df = get_xauusd_data()
-        if df.empty or len(df) < 30:
-            logger.warning("Not enough data")
-            return
-        indicators = calculate_indicators(df)
-        price = indicators["close"]
-        signal = generate_signal(indicators)
-        msg = format_signal_message(signal, price) if signal else format_price_message(price, indicators)
-        await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
-        logger.info(f"Sent. Price: {price}, Signal: {signal['direction'] if signal else 'None'}")
-    except Exception as e:
-        logger.error(f"Error in send_signal: {e}")
-
-
-async def start_command(update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 *XAUUSD Signal Bot Active!*\n\nSending BUY/SELL signals every 5 minutes with Entry, TP and SL!\n\nUse /price for instant signal 🚀",
-        parse_mode="Markdown"
-    )
-    bot = context.bot
-    await send_signal(bot)
-
-
-async def price_command(update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Fetching live price...")
-    await send_signal(context.bot)
-
-
-async def run_scheduler(bot: Bot):
+def main():
+    logger.info("Bot starting...")
+    send_telegram("🤖 *XAUUSD Signal Bot is now LIVE!*\n\nSending signals every 5 minutes 🚀")
+    
     while True:
-        await asyncio.sleep(300)  # 5 minutes
-        await send_signal(bot)
-
-
-async def main():
-    if not TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN not set!")
-    if not CHAT_ID:
-        raise ValueError("TELEGRAM_CHAT_ID not set!")
-
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("price", price_command))
-
-    bot = Bot(token=TOKEN)
-
-    # Send first signal on startup
-    await send_signal(bot)
-
-    # Run scheduler in background
-    asyncio.create_task(run_scheduler(bot))
-
-    logger.info("Bot started!")
-    await app.run_polling(drop_pending_updates=True)
-
+        try:
+            df = get_price()
+            if df is not None:
+                msg = analyze(df)
+                if msg:
+                    send_telegram(msg)
+                else:
+                    logger.info("No message generated")
+            else:
+                logger.warning("Could not get price data")
+        except Exception as e:
+            logger.error(f"Main loop error: {e}")
+        
+        logger.info("Sleeping 5 minutes...")
+        time.sleep(300)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
