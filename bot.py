@@ -12,7 +12,6 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
-GOLD_API_KEY = os.environ.get('GOLD_API_KEY')
 
 TP_PIPS = 50
 SL_PIPS = 25
@@ -30,71 +29,21 @@ def send_telegram(msg):
         logger.error('Telegram error: ' + str(e))
         return False
 
-def bootstrap_history():
+def get_data():
     try:
         df = yf.Ticker('GC=F').history(period='5d', interval='5m')
-        if not df.empty:
-            # Get the price offset between futures and spot
-            spot_price = get_spot_price()[0]
-            futures_last = float(df['Close'].iloc[-1])
-            offset = (spot_price - futures_last) if spot_price else 0
-            logger.info('Price offset futures->spot: ' + str(round(offset, 2)))
-
-            for i in range(len(df)):
-                row = df.iloc[i]
-                candle_history.append({
-                    'close': float(row['Close']) + offset,
-                    'open':  float(row['Open'])  + offset,
-                    'high':  float(row['High'])  + offset,
-                    'low':   float(row['Low'])   + offset,
-                })
-            logger.info('Bootstrapped ' + str(len(candle_history)) + ' candles')
+        if not df.empty and len(df) >= 50:
+            logger.info('Got ' + str(len(df)) + ' candles from Yahoo')
+            return df
     except Exception as e:
-        logger.error('Bootstrap error: ' + str(e))
+        logger.error('Yahoo error: ' + str(e))
+    return None
 
-def get_spot_price():
-    try:
-        url = 'https://www.goldapi.io/api/XAU/USD'
-        headers = {'x-access-token': GOLD_API_KEY}
-        r = requests.get(url, headers=headers, timeout=10)
-        data = r.json()
-        price = data.get('price')
-        if price:
-            return float(price), float(data.get('open_price') or price), float(data.get('high_price') or price), float(data.get('low_price') or price)
-    except Exception as e:
-        logger.error('GoldAPI error: ' + str(e))
-
-    try:
-        r = requests.get('https://api.metals.live/v1/spot/gold', timeout=10)
-        data = r.json()
-        price = float(data[0].get('price'))
-        return price, price, price, price
-    except Exception as e:
-        logger.error('Metals.live error: ' + str(e))
-
-    try:
-        r = requests.get('https://gold-api.com/price/XAU', timeout=10)
-        data = r.json()
-        price = float(data.get('price'))
-        return price, price, price, price
-    except Exception as e:
-        logger.error('Gold-api.com error: ' + str(e))
-
-    return None, None, None, None
-
-def update_candles(price, open_p, high, low):
-    candle_history.append({'close': price, 'open': open_p, 'high': high, 'low': low})
-    if len(candle_history) > 500:
-        candle_history.pop(0)
-
-def analyze():
-    if len(candle_history) < 50:
-        return None
-
-    close = pd.Series([c['close'] for c in candle_history])
-    high  = pd.Series([c['high']  for c in candle_history])
-    low   = pd.Series([c['low']   for c in candle_history])
-    price = close.iloc[-1]
+def analyze(df):
+    close = df['Close']
+    high  = df['High']
+    low   = df['Low']
+    price = float(close.iloc[-1])
 
     ema9   = close.ewm(span=9,   adjust=False).mean()
     ema21  = close.ewm(span=21,  adjust=False).mean()
@@ -195,7 +144,7 @@ def strength_label(conf):
     elif conf >= 65: return '\u26A1 MODERATE'
     else: return '\U0001F7E1 WEAK'
 
-def build_msg(s, ind):
+def build_signal_msg(s, ind):
     now = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
     price = ind['price']
     conf = s['conf']
@@ -211,7 +160,7 @@ def build_msg(s, ind):
 
     msg  = header + '\n'
     msg += '\u2501' * 22 + '\n'
-    msg += '\U0001F4B0 *Spot Price: `$' + '{:,.2f}'.format(price) + '`*\n'
+    msg += '\U0001F4B0 *Price: `$' + '{:,.2f}'.format(price) + '`*\n'
     msg += '\u23F0 `' + now + '`\n\n'
     msg += '\U0001F4CB *ORDER DETAILS*\n'
     msg += '\u251C \U0001F3AF Entry: `$' + '{:,.2f}'.format(s['entry']) + '`\n'
@@ -230,49 +179,48 @@ def build_msg(s, ind):
     msg += '\u2501' * 22
     return msg
 
+def build_update_msg(ind):
+    now = datetime.utcnow().strftime('%H:%M UTC')
+    price = ind['price']
+    trend = 'Bullish' if ind['ema9'] > ind['ema21'] else 'Bearish'
+    major = 'Bullish' if price > ind['ema200'] else 'Bearish'
+    msg  = '\U0001F4E1 *XAUUSD M5 Update*\n'
+    msg += '\U0001F4B0 Price: `$' + '{:,.2f}'.format(price) + '`\n'
+    msg += '\u23F0 `' + now + '`\n'
+    msg += '\U0001F4CA Major: `' + major + '` | M5: `' + trend + '`\n'
+    msg += '\U0001F4C9 RSI: `' + str(round(ind['rsi'], 1)) + '`\n'
+    msg += '_Monitoring for strong setup..._'
+    return msg
+
 def main():
     logger.info('Bot starting...')
     send_telegram(
-        '\U0001F916 *XAUUSD Spot Signal Bot*\n\n'
-        '\u2705 Same price as MT5/Exness\n'
+        '\U0001F916 *XAUUSD Signal Bot LIVE!*\n\n'
+        '\u2705 Signals every 5 minutes\n'
         '\U0001F3AF BUY STOP / SELL STOP\n'
         '\U0001F4B0 TP: +50 pips | SL: -25 pips\n'
         '\U0001F4CA RR: 1:2\n'
         '\U0001F6E1 *DEMO MODE*\n\n'
-        '_Loading historical data now..._\n'
-        '_First signal in about 1 minute!_ \U0001F680'
+        '_First signal coming in 1 minute!_ \U0001F680'
     )
-
-    # Bootstrap with historical data so signals start immediately
-    bootstrap_history()
 
     while True:
         try:
-            price, open_p, high, low = get_spot_price()
-            if price:
-                update_candles(price, open_p, high, low)
-                ind = analyze()
-                if ind:
-                    s = generate_signal(ind)
-                    if s:
-                        msg = build_msg(s, ind)
-                        send_telegram(msg)
-                    else:
-                        now = datetime.utcnow().strftime('%H:%M UTC')
-                        trend = 'Bullish' if ind['ema9'] > ind['ema21'] else 'Bearish'
-                        send_telegram(
-                            '\U0001F4E1 *XAUUSD Update*\n'
-                            '\U0001F4B0 Spot: `$' + '{:,.2f}'.format(price) + '`\n'
-                            '\u23F0 `' + now + '`\n'
-                            '\U0001F4CA Trend: `' + trend + '`\n'
-                            '\U0001F4C9 RSI: `' + str(round(ind['rsi'], 1)) + '`\n'
-                            '_No strong setup yet. Monitoring..._'
-                        )
+            df = get_data()
+            if df is not None:
+                ind = analyze(df)
+                s = generate_signal(ind)
+                if s:
+                    msg = build_signal_msg(s, ind)
+                else:
+                    msg = build_update_msg(ind)
+                send_telegram(msg)
             else:
-                logger.warning('Could not get spot price')
-
+                logger.warning('Could not get data')
+                send_telegram('\u26A0\uFE0F Could not fetch data. Retrying in 5 mins...')
         except Exception as e:
             logger.error('Error: ' + str(e))
+            send_telegram('\u26A0\uFE0F Error: ' + str(e)[:100])
 
         logger.info('Sleeping 5 minutes...')
         time.sleep(300)
