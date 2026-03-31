@@ -5,6 +5,7 @@ from datetime import datetime
 import requests
 import pandas as pd
 import numpy as np
+import yfinance as yf
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,7 +18,6 @@ TP_PIPS = 50
 SL_PIPS = 25
 PIP = 0.10
 
-# Store candle history for indicators
 candle_history = []
 
 def send_telegram(msg):
@@ -30,41 +30,52 @@ def send_telegram(msg):
         logger.error('Telegram error: ' + str(e))
         return False
 
+def bootstrap_history():
+    try:
+        df = yf.Ticker('GC=F').history(period='5d', interval='5m')
+        if not df.empty:
+            # Get the price offset between futures and spot
+            spot_price = get_spot_price()[0]
+            futures_last = float(df['Close'].iloc[-1])
+            offset = (spot_price - futures_last) if spot_price else 0
+            logger.info('Price offset futures->spot: ' + str(round(offset, 2)))
+
+            for i in range(len(df)):
+                row = df.iloc[i]
+                candle_history.append({
+                    'close': float(row['Close']) + offset,
+                    'open':  float(row['Open'])  + offset,
+                    'high':  float(row['High'])  + offset,
+                    'low':   float(row['Low'])   + offset,
+                })
+            logger.info('Bootstrapped ' + str(len(candle_history)) + ' candles')
+    except Exception as e:
+        logger.error('Bootstrap error: ' + str(e))
+
 def get_spot_price():
-    # Source 1: GoldAPI.io - true XAUUSD spot
     try:
         url = 'https://www.goldapi.io/api/XAU/USD'
         headers = {'x-access-token': GOLD_API_KEY}
         r = requests.get(url, headers=headers, timeout=10)
         data = r.json()
         price = data.get('price')
-        open_price = data.get('open_price')
-        high = data.get('high_price')
-        low = data.get('low_price')
         if price:
-            logger.info('GoldAPI spot: ' + str(price))
-            return float(price), float(open_price or price), float(high or price), float(low or price)
+            return float(price), float(data.get('open_price') or price), float(data.get('high_price') or price), float(data.get('low_price') or price)
     except Exception as e:
         logger.error('GoldAPI error: ' + str(e))
 
-    # Source 2: Frankfurter / metals API fallback
     try:
-        url = 'https://api.metals.live/v1/spot/gold'
-        r = requests.get(url, timeout=10)
+        r = requests.get('https://api.metals.live/v1/spot/gold', timeout=10)
         data = r.json()
         price = float(data[0].get('price'))
-        logger.info('Metals.live spot: ' + str(price))
         return price, price, price, price
     except Exception as e:
         logger.error('Metals.live error: ' + str(e))
 
-    # Source 3: Gold-API.com free
     try:
-        url = 'https://gold-api.com/price/XAU'
-        r = requests.get(url, timeout=10)
+        r = requests.get('https://gold-api.com/price/XAU', timeout=10)
         data = r.json()
         price = float(data.get('price'))
-        logger.info('Gold-api.com spot: ' + str(price))
         return price, price, price, price
     except Exception as e:
         logger.error('Gold-api.com error: ' + str(e))
@@ -72,22 +83,17 @@ def get_spot_price():
     return None, None, None, None
 
 def update_candles(price, open_p, high, low):
-    candle = {'close': price, 'open': open_p, 'high': high, 'low': low}
-    candle_history.append(candle)
-    if len(candle_history) > 300:
+    candle_history.append({'close': price, 'open': open_p, 'high': high, 'low': low})
+    if len(candle_history) > 500:
         candle_history.pop(0)
-
-def get_series():
-    closes = [c['close'] for c in candle_history]
-    highs  = [c['high']  for c in candle_history]
-    lows   = [c['low']   for c in candle_history]
-    return pd.Series(closes), pd.Series(highs), pd.Series(lows)
 
 def analyze():
     if len(candle_history) < 50:
         return None
 
-    close, high, low = get_series()
+    close = pd.Series([c['close'] for c in candle_history])
+    high  = pd.Series([c['high']  for c in candle_history])
+    low   = pd.Series([c['low']   for c in candle_history])
     price = close.iloc[-1]
 
     ema9   = close.ewm(span=9,   adjust=False).mean()
@@ -114,21 +120,21 @@ def analyze():
     macd_cross_down = float(macd_line.iloc[-1]) < float(macd_sig.iloc[-1]) and float(macd_line.iloc[-2]) >= float(macd_sig.iloc[-2])
 
     return {
-        'price':       price,
-        'ema9':        float(ema9.iloc[-1]),
-        'ema21':       float(ema21.iloc[-1]),
-        'ema50':       float(ema50.iloc[-1]),
-        'ema200':      float(ema200.iloc[-1]),
-        'rsi':         float(rsi.iloc[-1]),
-        'macd_hist':   float(macd_hist.iloc[-1]),
-        'macd_prev':   float(macd_hist.iloc[-2]),
+        'price':           price,
+        'ema9':            float(ema9.iloc[-1]),
+        'ema21':           float(ema21.iloc[-1]),
+        'ema50':           float(ema50.iloc[-1]),
+        'ema200':          float(ema200.iloc[-1]),
+        'rsi':             float(rsi.iloc[-1]),
+        'macd_hist':       float(macd_hist.iloc[-1]),
+        'macd_prev':       float(macd_hist.iloc[-2]),
         'macd_cross_up':   macd_cross_up,
         'macd_cross_down': macd_cross_down,
-        'atr':         float(atr.iloc[-1]),
-        'swing_high':  float(swing_high.iloc[-1]),
-        'swing_low':   float(swing_low.iloc[-1]),
-        'hh':          price > float(close.iloc[-6]),
-        'll':          price < float(close.iloc[-6]),
+        'atr':             float(atr.iloc[-1]),
+        'swing_high':      float(swing_high.iloc[-1]),
+        'swing_low':       float(swing_low.iloc[-1]),
+        'hh':              price > float(close.iloc[-6]),
+        'll':              price < float(close.iloc[-6]),
     }
 
 def generate_signal(ind):
@@ -136,27 +142,22 @@ def generate_signal(ind):
     rsi = ind['rsi']
     buys = sells = 0
 
-    # Major trend EMA200 - 3pts
     if price > ind['ema200']: buys += 3
     else: sells += 3
 
-    # EMA alignment - 3pts
     if ind['ema9'] > ind['ema21'] > ind['ema50']: buys += 3
     elif ind['ema9'] < ind['ema21'] < ind['ema50']: sells += 3
 
-    # MACD cross - 2pts
     if ind['macd_cross_up']: buys += 2
     elif ind['macd_cross_down']: sells += 2
     elif ind['macd_hist'] > 0 and ind['macd_hist'] > ind['macd_prev']: buys += 1
     elif ind['macd_hist'] < 0 and ind['macd_hist'] < ind['macd_prev']: sells += 1
 
-    # RSI - 2pts
     if 45 <= rsi <= 65 and buys > sells: buys += 2
     elif 35 <= rsi <= 55 and sells > buys: sells += 2
     elif rsi < 35: buys += 2
     elif rsi > 65: sells += 2
 
-    # Structure - 1pt
     if ind['hh']: buys += 1
     elif ind['ll']: sells += 1
 
@@ -203,25 +204,25 @@ def build_msg(s, ind):
 
     if s['type'] == 'BUY STOP':
         header = '\U0001F7E2 *XAUUSD BUY STOP* \U0001F4C8'
-        note = '_On MT5: New Order > Buy Stop > Set entry, TP, SL_'
+        note = '_MT5: New Order > Buy Stop > Set prices below_'
     else:
         header = '\U0001F534 *XAUUSD SELL STOP* \U0001F4C9'
-        note = '_On MT5: New Order > Sell Stop > Set entry, TP, SL_'
+        note = '_MT5: New Order > Sell Stop > Set prices below_'
 
     msg  = header + '\n'
     msg += '\u2501' * 22 + '\n'
-    msg += '\U0001F4B0 *XAUUSD Spot: `$' + '{:,.2f}'.format(price) + '`*\n'
+    msg += '\U0001F4B0 *Spot Price: `$' + '{:,.2f}'.format(price) + '`*\n'
     msg += '\u23F0 `' + now + '`\n\n'
     msg += '\U0001F4CB *ORDER DETAILS*\n'
-    msg += '\u251C \U0001F3AF Pending Entry: `$' + '{:,.2f}'.format(s['entry']) + '`\n'
-    msg += '\u251C \u2705 Take Profit:  `$' + '{:,.2f}'.format(s['tp']) + '`\n'
-    msg += '\u2514 \u274C Stop Loss:    `$' + '{:,.2f}'.format(s['sl']) + '`\n\n'
-    msg += '\U0001F4CA *MARKET ANALYSIS*\n'
-    msg += '\u251C Major Trend: `' + major + '` (EMA200)\n'
-    msg += '\u251C M5 Trend:    `' + trend + '` (EMA9/21)\n'
-    msg += '\u251C RSI:         `' + str(s['rsi']) + '`\n'
+    msg += '\u251C \U0001F3AF Entry: `$' + '{:,.2f}'.format(s['entry']) + '`\n'
+    msg += '\u251C \u2705 TP:    `$' + '{:,.2f}'.format(s['tp']) + '`\n'
+    msg += '\u2514 \u274C SL:    `$' + '{:,.2f}'.format(s['sl']) + '`\n\n'
+    msg += '\U0001F4CA *ANALYSIS*\n'
+    msg += '\u251C Major Trend: `' + major + '`\n'
+    msg += '\u251C M5 Trend:    `' + trend + '`\n'
+    msg += '\u251C RSI: `' + str(s['rsi']) + '`\n'
     msg += '\u251C Score: `' + str(s['buys']) + ' BUY vs ' + str(s['sells']) + ' SELL`\n'
-    msg += '\u2514 RR: `1:2` \U0001F3AF\n\n'
+    msg += '\u2514 RR: `1:2`\n\n'
     msg += '\U0001F4AA Strength: `' + str(conf) + '%` ' + strength_label(conf) + '\n'
     msg += strength_bar(conf) + '\n\n'
     msg += note + '\n'
@@ -237,10 +238,13 @@ def main():
         '\U0001F3AF BUY STOP / SELL STOP\n'
         '\U0001F4B0 TP: +50 pips | SL: -25 pips\n'
         '\U0001F4CA RR: 1:2\n'
-        '\U0001F6E1 *DEMO MODE - Practice first!*\n\n'
-        '_Collecting spot price data..._\n'
-        '_Signals start in ~10 mins_ \U0001F680'
+        '\U0001F6E1 *DEMO MODE*\n\n'
+        '_Loading historical data now..._\n'
+        '_First signal in about 1 minute!_ \U0001F680'
     )
+
+    # Bootstrap with historical data so signals start immediately
+    bootstrap_history()
 
     while True:
         try:
@@ -262,10 +266,8 @@ def main():
                             '\u23F0 `' + now + '`\n'
                             '\U0001F4CA Trend: `' + trend + '`\n'
                             '\U0001F4C9 RSI: `' + str(round(ind['rsi'], 1)) + '`\n'
-                            '_Monitoring for strong setup..._'
+                            '_No strong setup yet. Monitoring..._'
                         )
-                else:
-                    logger.info('Building price history: ' + str(len(candle_history)) + '/50')
             else:
                 logger.warning('Could not get spot price')
 
