@@ -1,228 +1,228 @@
 import os
 import time
-import logging
-from datetime import datetime
 import requests
 import pandas as pd
 import numpy as np
+from datetime import datetime
 import yfinance as yf
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 
-TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
-
-TP_PIPS = 50
-SL_PIPS = 25
-PIP = 0.10
-
-candle_history = []
-
-def send_telegram(msg):
-    url = 'https://api.telegram.org/bot' + TOKEN + '/sendMessage'
-    data = {'chat_id': CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'}
+def send_telegram(message):
+    url = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage'
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
     try:
-        r = requests.post(url, data=data, timeout=10)
-        return r.ok
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        logger.error('Telegram error: ' + str(e))
-        return False
+        print(f'Telegram error: {e}')
 
-def get_data():
+def get_usdjpy_price():
     try:
-        df = yf.Ticker('GC=F').history(period='5d', interval='5m')
-        if not df.empty and len(df) >= 50:
-            logger.info('Got ' + str(len(df)) + ' candles from Yahoo')
-            return df
+        ticker = yf.Ticker('JPY=X')
+        data = ticker.history(period='1d', interval='1m')
+        if not data.empty:
+            price = float(data['Close'].iloc[-1])
+            return round(price, 3)
     except Exception as e:
-        logger.error('Yahoo error: ' + str(e))
+        print(f'Price error: {e}')
     return None
 
-def analyze(df):
+def load_history():
+    try:
+        ticker = yf.Ticker('JPY=X')
+        data = ticker.history(period='5d', interval='5m')
+        if not data.empty:
+            print(f'Loaded {len(data)} candles of USDJPY history')
+            return data
+    except Exception as e:
+        print(f'History error: {e}')
+    return pd.DataFrame()
+
+def calculate_indicators(df):
     close = df['Close']
-    high  = df['High']
-    low   = df['Low']
-    price = float(close.iloc[-1])
+    high = df['High']
+    low = df['Low']
 
-    ema9   = close.ewm(span=9,   adjust=False).mean()
-    ema21  = close.ewm(span=21,  adjust=False).mean()
-    ema50  = close.ewm(span=50,  adjust=False).mean()
-    ema200 = close.ewm(span=min(200, len(close)), adjust=False).mean()
+    # EMAs
+    df['ema9'] = close.ewm(span=9).mean()
+    df['ema21'] = close.ewm(span=21).mean()
+    df['ema50'] = close.ewm(span=50).mean()
+    df['ema200'] = close.ewm(span=200).mean()
 
+    # RSI
     delta = close.diff()
-    gain = delta.where(delta > 0, 0).rolling(14).mean()
-    loss = -delta.where(delta < 0, 0).rolling(14).mean()
-    rsi = 100 - (100 / (1 + gain / loss))
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
 
-    macd_line = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
-    macd_sig  = macd_line.ewm(span=9, adjust=False).mean()
-    macd_hist = macd_line - macd_sig
+    # MACD
+    ema12 = close.ewm(span=12).mean()
+    ema26 = close.ewm(span=26).mean()
+    df['macd'] = ema12 - ema26
+    df['signal_line'] = df['macd'].ewm(span=9).mean()
+    df['macd_hist'] = df['macd'] - df['signal_line']
 
-    tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean()
+    # Swing highs/lows (last 20 candles)
+    df['swing_high'] = high.rolling(20).max()
+    df['swing_low'] = low.rolling(20).min()
 
-    swing_high = high.rolling(14).max()
-    swing_low  = low.rolling(14).min()
+    # ATR
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    df['atr'] = tr.rolling(14).mean()
 
-    macd_cross_up   = float(macd_line.iloc[-1]) > float(macd_sig.iloc[-1]) and float(macd_line.iloc[-2]) <= float(macd_sig.iloc[-2])
-    macd_cross_down = float(macd_line.iloc[-1]) < float(macd_sig.iloc[-1]) and float(macd_line.iloc[-2]) >= float(macd_sig.iloc[-2])
+    return df
 
-    return {
-        'price':           price,
-        'ema9':            float(ema9.iloc[-1]),
-        'ema21':           float(ema21.iloc[-1]),
-        'ema50':           float(ema50.iloc[-1]),
-        'ema200':          float(ema200.iloc[-1]),
-        'rsi':             float(rsi.iloc[-1]),
-        'macd_hist':       float(macd_hist.iloc[-1]),
-        'macd_prev':       float(macd_hist.iloc[-2]),
-        'macd_cross_up':   macd_cross_up,
-        'macd_cross_down': macd_cross_down,
-        'atr':             float(atr.iloc[-1]),
-        'swing_high':      float(swing_high.iloc[-1]),
-        'swing_low':       float(swing_low.iloc[-1]),
-        'hh':              price > float(close.iloc[-6]),
-        'll':              price < float(close.iloc[-6]),
-    }
+def generate_signal(df):
+    if len(df) < 200:
+        return None
 
-def generate_signal(ind):
-    price = ind['price']
-    rsi = ind['rsi']
-    buys = sells = 0
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    if price > ind['ema200']: buys += 3
-    else: sells += 3
+    price = latest['Close']
+    ema9 = latest['ema9']
+    ema21 = latest['ema21']
+    ema50 = latest['ema50']
+    ema200 = latest['ema200']
+    rsi = latest['rsi']
+    macd = latest['macd']
+    macd_sig = latest['signal_line']
+    macd_hist = latest['macd_hist']
+    prev_macd_hist = prev['macd_hist']
+    swing_high = latest['swing_high']
+    swing_low = latest['swing_low']
+    atr = latest['atr']
 
-    if ind['ema9'] > ind['ema21'] > ind['ema50']: buys += 3
-    elif ind['ema9'] < ind['ema21'] < ind['ema50']: sells += 3
+    # --- BUY STOP scoring ---
+    buy_score = 0
+    buy_reasons = []
 
-    if ind['macd_cross_up']: buys += 2
-    elif ind['macd_cross_down']: sells += 2
-    elif ind['macd_hist'] > 0 and ind['macd_hist'] > ind['macd_prev']: buys += 1
-    elif ind['macd_hist'] < 0 and ind['macd_hist'] < ind['macd_prev']: sells += 1
+    if price > ema200:
+        buy_score += 20
+        buy_reasons.append('Above EMA200 (uptrend)')
+    if ema9 > ema21 > ema50:
+        buy_score += 20
+        buy_reasons.append('EMA9>21>50 aligned bullish')
+    if macd > macd_sig and macd_hist > prev_macd_hist:
+        buy_score += 20
+        buy_reasons.append('MACD bullish crossover')
+    if 45 < rsi < 70:
+        buy_score += 20
+        buy_reasons.append('RSI in bullish zone')
+    if price > ema9 and price > ema21:
+        buy_score += 20
+        buy_reasons.append('Price above key EMAs')
 
-    if 45 <= rsi <= 65 and buys > sells: buys += 2
-    elif 35 <= rsi <= 55 and sells > buys: sells += 2
-    elif rsi < 35: buys += 2
-    elif rsi > 65: sells += 2
+    # --- SELL STOP scoring ---
+    sell_score = 0
+    sell_reasons = []
 
-    if ind['hh']: buys += 1
-    elif ind['ll']: sells += 1
+    if price < ema200:
+        sell_score += 20
+        sell_reasons.append('Below EMA200 (downtrend)')
+    if ema9 < ema21 < ema50:
+        sell_score += 20
+        sell_reasons.append('EMA9<21<50 aligned bearish')
+    if macd < macd_sig and macd_hist < prev_macd_hist:
+        sell_score += 20
+        sell_reasons.append('MACD bearish crossover')
+    if 30 < rsi < 55:
+        sell_score += 20
+        sell_reasons.append('RSI in bearish zone')
+    if price < ema9 and price < ema21:
+        sell_score += 20
+        sell_reasons.append('Price below key EMAs')
 
-    total = buys + sells
-    if total == 0: return None
+    # Pip size for JPY pairs = 0.01
+    pip = 0.01
+    tp_pips = 30
+    sl_pips = 15
+    rr = tp_pips / sl_pips
 
-    if buys > sells:
-        raw = buys / total
-        conf = min(int(50 + raw * 50), 99)
-        entry = round(ind['swing_high'] + PIP * 3, 2)
-        return {'type': 'BUY STOP', 'entry': entry,
-                'tp': round(entry + TP_PIPS * PIP, 2),
-                'sl': round(entry - SL_PIPS * PIP, 2),
-                'rsi': round(rsi, 1), 'conf': conf,
-                'buys': buys, 'sells': sells}
+    if buy_score >= sell_score:
+        direction = 'BUY STOP'
+        entry = round(swing_high + (2 * pip), 3)
+        tp = round(entry + (tp_pips * pip), 3)
+        sl = round(entry - (sl_pips * pip), 3)
+        strength = buy_score
+        reasons = buy_reasons
+        emoji = '🟢'
+        arrow = '📈'
     else:
-        raw = sells / total
-        conf = min(int(50 + raw * 50), 99)
-        entry = round(ind['swing_low'] - PIP * 3, 2)
-        return {'type': 'SELL STOP', 'entry': entry,
-                'tp': round(entry - TP_PIPS * PIP, 2),
-                'sl': round(entry + SL_PIPS * PIP, 2),
-                'rsi': round(rsi, 1), 'conf': conf,
-                'buys': buys, 'sells': sells}
+        direction = 'SELL STOP'
+        entry = round(swing_low - (2 * pip), 3)
+        tp = round(entry - (tp_pips * pip), 3)
+        sl = round(entry + (sl_pips * pip), 3)
+        strength = sell_score
+        reasons = sell_reasons
+        emoji = '🔴'
+        arrow = '📉'
 
-def strength_bar(conf):
-    filled = max(0, int((conf - 50) / 50 * 10))
-    if conf >= 80: block = '\U0001F7E9'
-    elif conf >= 65: block = '\U0001F7E8'
-    else: block = '\U0001F7E5'
-    return block * filled + '\u2B1C' * (10 - filled)
+    label = 'STRONG 🔥' if strength >= 80 else ('MODERATE ⚡' if strength >= 60 else 'WEAK 🟡')
 
-def strength_label(conf):
-    if conf >= 80: return '\U0001F525 STRONG'
-    elif conf >= 65: return '\u26A1 MODERATE'
-    else: return '\U0001F7E1 WEAK'
+    reasons_text = '\n'.join([f'  ✅ {r}' for r in reasons]) if reasons else '  ⚠️ Mixed signals'
 
-def build_signal_msg(s, ind):
-    now = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
-    price = ind['price']
-    conf = s['conf']
-    major = 'Bullish' if price > ind['ema200'] else 'Bearish'
-    trend = 'Bullish' if ind['ema9'] > ind['ema21'] else 'Bearish'
+    msg = (
+        f'{emoji} <b>USDJPY {direction}</b> {arrow}\n'
+        f'━━━━━━━━━━━━━━━━━━━━\n'
+        f'💰 <b>Current Price:</b> {price:.3f}\n'
+        f'🎯 <b>Pending Entry:</b> {entry:.3f}\n'
+        f'✅ <b>Take Profit:</b>   {tp:.3f} (+{tp_pips} pips)\n'
+        f'❌ <b>Stop Loss:</b>     {sl:.3f} (-{sl_pips} pips)\n'
+        f'⚖️ <b>Risk/Reward:</b>   1:{rr:.1f}\n'
+        f'📊 <b>RSI:</b> {rsi:.1f} | <b>MACD:</b> {"Bullish" if macd > macd_sig else "Bearish"}\n'
+        f'💪 <b>Strength:</b> {strength}% — {label}\n'
+        f'━━━━━━━━━━━━━━━━━━━━\n'
+        f'📋 <b>Why this signal:</b>\n{reasons_text}\n'
+        f'━━━━━━━━━━━━━━━━━━━━\n'
+        f'📌 <b>Lot size:</b> 0.01 (safe for $10 account)\n'
+        f'⚠️ <b>Demo test recommended first!</b>\n'
+        f'⏰ {datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC'
+    )
 
-    if s['type'] == 'BUY STOP':
-        header = '\U0001F7E2 *XAUUSD BUY STOP* \U0001F4C8'
-        note = '_MT5: New Order > Buy Stop > Set prices below_'
-    else:
-        header = '\U0001F534 *XAUUSD SELL STOP* \U0001F4C9'
-        note = '_MT5: New Order > Sell Stop > Set prices below_'
-
-    msg  = header + '\n'
-    msg += '\u2501' * 22 + '\n'
-    msg += '\U0001F4B0 *Price: `$' + '{:,.2f}'.format(price) + '`*\n'
-    msg += '\u23F0 `' + now + '`\n\n'
-    msg += '\U0001F4CB *ORDER DETAILS*\n'
-    msg += '\u251C \U0001F3AF Entry: `$' + '{:,.2f}'.format(s['entry']) + '`\n'
-    msg += '\u251C \u2705 TP:    `$' + '{:,.2f}'.format(s['tp']) + '`\n'
-    msg += '\u2514 \u274C SL:    `$' + '{:,.2f}'.format(s['sl']) + '`\n\n'
-    msg += '\U0001F4CA *ANALYSIS*\n'
-    msg += '\u251C Major Trend: `' + major + '`\n'
-    msg += '\u251C M5 Trend:    `' + trend + '`\n'
-    msg += '\u251C RSI: `' + str(s['rsi']) + '`\n'
-    msg += '\u251C Score: `' + str(s['buys']) + ' BUY vs ' + str(s['sells']) + ' SELL`\n'
-    msg += '\u2514 RR: `1:2`\n\n'
-    msg += '\U0001F4AA Strength: `' + str(conf) + '%` ' + strength_label(conf) + '\n'
-    msg += strength_bar(conf) + '\n\n'
-    msg += note + '\n'
-    msg += '\u26A0\uFE0F _DEMO ONLY - 1 trade at a time!_\n'
-    msg += '\u2501' * 22
-    return msg
-
-def build_update_msg(ind):
-    now = datetime.utcnow().strftime('%H:%M UTC')
-    price = ind['price']
-    trend = 'Bullish' if ind['ema9'] > ind['ema21'] else 'Bearish'
-    major = 'Bullish' if price > ind['ema200'] else 'Bearish'
-    msg  = '\U0001F4E1 *XAUUSD M5 Update*\n'
-    msg += '\U0001F4B0 Price: `$' + '{:,.2f}'.format(price) + '`\n'
-    msg += '\u23F0 `' + now + '`\n'
-    msg += '\U0001F4CA Major: `' + major + '` | M5: `' + trend + '`\n'
-    msg += '\U0001F4C9 RSI: `' + str(round(ind['rsi'], 1)) + '`\n'
-    msg += '_Monitoring for strong setup..._'
     return msg
 
 def main():
-    logger.info('Bot starting...')
+    print('USDJPY Signal Bot starting...')
     send_telegram(
-        '\U0001F916 *XAUUSD Signal Bot LIVE!*\n\n'
-        '\u2705 Signals every 5 minutes\n'
-        '\U0001F3AF BUY STOP / SELL STOP\n'
-        '\U0001F4B0 TP: +50 pips | SL: -25 pips\n'
-        '\U0001F4CA RR: 1:2\n'
-        '\U0001F6E1 *DEMO MODE*\n\n'
-        '_First signal coming in 1 minute!_ \U0001F680'
+        '🤖 <b>USDJPY Signal Bot LIVE!</b>\n\n'
+        '✅ Real-time USDJPY prices\n'
+        '🎯 BUY STOP / SELL STOP signals\n'
+        '📊 EMA + RSI + MACD strategy\n'
+        '💰 Optimised for 0.01 lot / $10 account\n'
+        '⏱ Signals every 5 minutes\n\n'
+        '⚠️ <b>Always test on demo first!</b>\n'
+        'Loading market data... first signal in ~1 min 🚀'
     )
+
+    df = load_history()
 
     while True:
         try:
-            df = get_data()
-            if df is not None:
-                ind = analyze(df)
-                s = generate_signal(ind)
-                if s:
-                    msg = build_signal_msg(s, ind)
-                else:
-                    msg = build_update_msg(ind)
-                send_telegram(msg)
-            else:
-                logger.warning('Could not get data')
-                send_telegram('\u26A0\uFE0F Could not fetch data. Retrying in 5 mins...')
+            price = get_usdjpy_price()
+            if price and not df.empty:
+                now = datetime.utcnow()
+                new_row = pd.DataFrame([{
+                    'Open': price, 'High': price, 'Low': price,
+                    'Close': price, 'Volume': 0
+                }], index=[now])
+                df = pd.concat([df, new_row]).tail(500)
+                df = calculate_indicators(df)
+                signal = generate_signal(df)
+                if signal:
+                    send_telegram(signal)
+                    print(f'Signal sent at {now}')
+            elif df.empty:
+                df = load_history()
         except Exception as e:
-            logger.error('Error: ' + str(e))
-            send_telegram('\u26A0\uFE0F Error: ' + str(e)[:100])
+            print(f'Loop error: {e}')
 
-        logger.info('Sleeping 5 minutes...')
         time.sleep(300)
 
 if __name__ == '__main__':
