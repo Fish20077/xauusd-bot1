@@ -1,6 +1,6 @@
 services:
   - type: worker
-    name: xauusd-signal-bot
+    name: usdjpy-signal-bot
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
